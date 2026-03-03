@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Admin Login</title>
+  <link rel="stylesheet" href="css/style.css" />
+  <script defer src="js/admin-login.js"></script>
+</head>
+<body>
+  <div class="container">
+    <div class="card">
+      <h2 style="margin-top:0;">管理者ログイン</h2>
+      <div class="small">※URLを知っていても、ログインしないと管理画面は開きません</div>
+
+      <div style="height:10px;"></div>
+
+      <input class="input" id="email" type="email" placeholder="メール" />
+      <input class="input" id="pass" type="password" placeholder="パスワード" />
+
+      <div class="error" id="err"></div>
+
+      <button class="cta cta--grad" id="loginBtn">ログイン</button>
+    </div>
+  </div>
+</body>
+</html>

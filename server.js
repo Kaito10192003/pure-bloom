@@ -1,23 +1,38 @@
 require("dotenv").config();
 
 const path = require("path");
-const fs = require("fs/promises");
+const fs = require("fs");
 const express = require("express");
-// Renderの本番URL（なければローカル）
-
 const Stripe = require("stripe");
 const nodemailer = require("nodemailer");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+const session = require("express-session");
+const Database = require("better-sqlite3");
 
 const app = express();
-app.use(express.json());
-app.use(express.static(path.join(__dirname, "public")));
+
+// Render(Proxy)配下で secure cookie 判定に必要
+app.set("trust proxy", 1);
+
+// ===== Security middlewares =====
+app.use(helmet());
+
+// JSONはWebhook以外で使う
+app.use((req, res, next) => {
+  // Stripe webhookだけは raw が必要なので後で個別に処理する
+  if (req.originalUrl === "/stripe/webhook") return next();
+  express.json({ limit: "200kb" })(req, res, next);
+});
+
+// 静的配信
+app.use(express.static(path.join(__dirname, "public"), { maxAge: "1h" }));
+
+// ルートは広告へ
 app.get("/", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "ad.html"));
 });
-// ✅ dashboard直叩きはログイン画面へ（一覧ページ直行を防ぐ）
-app.get("/dashboard.html", (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "admin.html"));
-});
+
 // ===== Stripe =====
 const stripeSecret = process.env.STRIPE_SECRET_KEY;
 if (!stripeSecret) {
@@ -26,52 +41,121 @@ if (!stripeSecret) {
 }
 const stripe = Stripe(stripeSecret);
 
-// ===== 公開URL（Render等） =====
-// Renderでは BASE_URL を環境変数に入れるのが確実
-// 例: https://xxxxx.onrender.com
 const PORT = process.env.PORT || 3000;
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 
-// ===== 保存先（年/月/日） =====
-const DATA_ROOT = path.join(__dirname, "data", "orders");
-
-function pad2(n) {
-  return String(n).padStart(2, "0");
-}
-function ymdParts(date = new Date()) {
-  const y = String(date.getFullYear());
-  const m = pad2(date.getMonth() + 1);
-  const d = pad2(date.getDate());
-  return { y, m, d };
-}
-function dayDir(date = new Date()) {
-  const { y, m, d } = ymdParts(date);
-  return path.join(DATA_ROOT, y, m, d);
-}
-async function ensureDir(p) {
-  await fs.mkdir(p, { recursive: true });
+// ===== Session (Admin) =====
+if (!process.env.SESSION_SECRET) {
+  console.error("❌ SESSION_SECRET が環境変数に設定されていません");
+  process.exit(1);
 }
 
-async function readOrdersForDay(date = new Date()) {
-  const dir = dayDir(date);
-  const file = path.join(dir, "orders.json");
-  try {
-    const txt = await fs.readFile(file, "utf-8");
-    return JSON.parse(txt);
-  } catch {
-    return [];
-  }
-}
-async function writeOrdersForDay(date = new Date(), orders) {
-  const dir = dayDir(date);
-  await ensureDir(dir);
-  const file = path.join(dir, "orders.json");
-  await fs.writeFile(file, JSON.stringify(orders, null, 2), "utf-8");
+app.use(
+  session({
+    name: "pb.sid",
+    secret: process.env.SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: process.env.NODE_ENV === "production", // Renderはproduction扱いにしたいなら envでNODE_ENV=production
+      maxAge: 1000 * 60 * 60 * 6, // 6時間
+    },
+  })
+);
+
+function requireAdmin(req, res, next) {
+  if (req.session && req.session.admin === true) return next();
+  return res.status(401).json({ error: "unauthorized" });
 }
 
-// ===== メール送信（SMTP）=====
-// RenderのEnvironment Variablesに以下を入れる想定：
-// SMTP_HOST, SMTP_PORT, SMTP_SECURE, SMTP_USER, SMTP_PASS, MAIL_FROM(任意)
+// ===== DB (SQLite) =====
+fs.mkdirSync(path.join(__dirname, "data"), { recursive: true });
+const db = new Database(path.join(__dirname, "data", "app.db"));
+db.pragma("journal_mode = WAL");
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  orderId TEXT UNIQUE,
+  name TEXT,
+  phone TEXT,
+  email TEXT,
+  address TEXT,
+  paymentMethod TEXT,
+  konbiniStore TEXT,
+  amount INTEGER,
+  currency TEXT,
+  status TEXT,
+  stripeSessionId TEXT,
+  stripePaymentIntentId TEXT,
+  createdAt TEXT,
+  paidAt TEXT
+);
+
+CREATE TABLE IF NOT EXISTS contacts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT,
+  email TEXT,
+  subject TEXT,
+  message TEXT,
+  createdAt TEXT
+);
+`);
+
+const stmtInsertOrder = db.prepare(`
+INSERT INTO orders (orderId, name, phone, email, address, paymentMethod, konbiniStore, amount, currency, status, createdAt)
+VALUES (@orderId, @name, @phone, @email, @address, @paymentMethod, @konbiniStore, @amount, @currency, @status, @createdAt)
+`);
+
+const stmtUpdateOrderByOrderId = db.prepare(`
+UPDATE orders SET
+  status=@status,
+  stripeSessionId=COALESCE(@stripeSessionId, stripeSessionId),
+  stripePaymentIntentId=COALESCE(@stripePaymentIntentId, stripePaymentIntentId),
+  paidAt=COALESCE(@paidAt, paidAt)
+WHERE orderId=@orderId
+`);
+
+const stmtGetOrderByOrderId = db.prepare(`SELECT * FROM orders WHERE orderId=?`);
+
+const stmtOrdersByDate = db.prepare(`
+SELECT * FROM orders
+WHERE date(createdAt) = date(?)
+ORDER BY createdAt DESC
+`);
+
+const stmtSalesDay = db.prepare(`
+SELECT COALESCE(SUM(amount),0) AS total
+FROM orders
+WHERE status='paid'
+  AND strftime('%Y', createdAt)=?
+  AND strftime('%m', createdAt)=?
+  AND strftime('%d', createdAt)=?
+`);
+
+const stmtSalesMonth = db.prepare(`
+SELECT COALESCE(SUM(amount),0) AS total
+FROM orders
+WHERE status='paid'
+  AND strftime('%Y', createdAt)=?
+  AND strftime('%m', createdAt)=?
+`);
+
+const stmtSalesYear = db.prepare(`
+SELECT COALESCE(SUM(amount),0) AS total
+FROM orders
+WHERE status='paid'
+  AND strftime('%Y', createdAt)=?
+`);
+
+const stmtInsertContact = db.prepare(`
+INSERT INTO contacts (name, email, subject, message, createdAt)
+VALUES (@name, @email, @subject, @message, @createdAt)
+`);
+
+// ===== Mail (SMTP) =====
 function buildTransporter() {
   const host = process.env.SMTP_HOST;
   const port = Number(process.env.SMTP_PORT || "465");
@@ -95,6 +179,7 @@ async function sendPurchaseMail({ to, name, orderId, amount, paymentMethod }) {
     console.warn("⚠ SMTP未設定のためメール送信をスキップしました");
     return;
   }
+
   const from = process.env.MAIL_FROM || process.env.SMTP_USER || "no-reply@example.com";
   const subject = "【ご注文ありがとうございます】";
   const text = `${name} 様
@@ -109,14 +194,22 @@ async function sendPurchaseMail({ to, name, orderId, amount, paymentMethod }) {
   await transporter.sendMail({ from, to, subject, text });
 }
 
-// ===== 商品設定（例）=====
+// ===== Product =====
 const PRODUCT = {
   name: "Premium Supplement（デモ）",
-  unitAmount: 4980, // 円
+  unitAmount: 4980,
   currency: "jpy",
 };
 
-// ===== Checkoutセッション作成 =====
+// ===== Rate limit (admin login) =====
+const adminLoginLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// ===== Checkout Session =====
 app.post("/create-checkout-session", async (req, res) => {
   try {
     const { name, phone, email, address, paymentMethod, konbiniStore } = req.body || {};
@@ -124,12 +217,11 @@ app.post("/create-checkout-session", async (req, res) => {
       return res.status(400).json({ error: "必須項目が不足しています" });
     }
 
-    // 注文を日付ディレクトリへ保存（pending）
     const orderId = "ord_" + Date.now();
-    const now = new Date();
-    const orders = await readOrdersForDay(now);
+    const createdAt = new Date().toISOString();
 
-    const newOrder = {
+    // 先にDBへ pending を保存
+    stmtInsertOrder.run({
       orderId,
       name,
       phone,
@@ -140,20 +232,17 @@ app.post("/create-checkout-session", async (req, res) => {
       amount: PRODUCT.unitAmount,
       currency: PRODUCT.currency,
       status: "pending",
-      createdAt: now.toISOString(),
-    };
-    orders.push(newOrder);
-    await writeOrdersForDay(now, orders);
+      createdAt,
+    });
 
-    // Stripe：支払方法
-    // ※ Konbini / PayPay はStripe側で利用可能化が必要な場合があります
+    // 支払方法（Stripe側で有効化が必要な場合あり）
     const payment_method_types = (() => {
       if (paymentMethod === "konbini") return ["konbini"];
       if (paymentMethod === "paypay") return ["paypay"];
       return ["card"];
     })();
 
-    const session = await stripe.checkout.sessions.create({
+    const sessionObj = await stripe.checkout.sessions.create({
       mode: "payment",
       payment_method_types,
       line_items: [
@@ -166,7 +255,6 @@ app.post("/create-checkout-session", async (req, res) => {
           quantity: 1,
         },
       ],
-      // ✅ localhost固定をやめてBASE_URLにする（公開対応）
       success_url: `${BASE_URL}/success.html?orderId=${orderId}`,
       cancel_url: `${BASE_URL}/cancel.html?orderId=${orderId}`,
       metadata: {
@@ -174,129 +262,185 @@ app.post("/create-checkout-session", async (req, res) => {
         paymentMethod: paymentMethod || "card",
         konbiniStore: paymentMethod === "konbini" ? (konbiniStore || "") : "",
       },
+      // customer_email を入れると Stripe画面でメール扱いやすい
+      customer_email: email,
     });
 
-    return res.json({ url: session.url });
+    // session id をDBへ記録（支払照合に使える）
+    stmtUpdateOrderByOrderId.run({
+      orderId,
+      status: "pending",
+      stripeSessionId: sessionObj.id,
+      stripePaymentIntentId: null,
+      paidAt: null,
+    });
+
+    return res.json({ url: sessionObj.url });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// ===== デモ：成功ページから paid に更新＋メール送信 =====
-// 本番はWebhookで「支払い確定」を検証してから更新が正解
-app.post("/mark-paid", async (req, res) => {
-  try {
-    const { orderId } = req.body || {};
-    if (!orderId) return res.status(400).json({ error: "orderId required" });
+// ===== Stripe Webhook (支払い確定はここだけ) =====
+app.post(
+  "/stripe/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const sig = req.headers["stripe-signature"];
+    const whsec = process.env.STRIPE_WEBHOOK_SECRET;
 
-    // デモでは「今日分」だけ更新
-    const now = new Date();
-    const orders = await readOrdersForDay(now);
-    const target = orders.find((o) => o.orderId === orderId);
-    if (!target) return res.status(404).json({ error: "order not found (today only demo)" });
+    if (!whsec) {
+      console.error("❌ STRIPE_WEBHOOK_SECRET が未設定です");
+      return res.status(500).send("Webhook secret not set");
+    }
 
-    target.status = "paid_demo";
-    await writeOrdersForDay(now, orders);
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(req.body, sig, whsec);
+    } catch (err) {
+      console.error("❌ Webhook signature verify failed:", err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
 
-    // メール送信（SMTP設定がある場合のみ）
-    await sendPurchaseMail({
-      to: target.email,
-      name: target.name,
-      orderId: target.orderId,
-      amount: target.amount,
-      paymentMethod: target.paymentMethod,
-    });
+    try {
+      // 代表：Checkout完了
+      if (event.type === "checkout.session.completed") {
+        const sessionObj = event.data.object;
+        const orderId = sessionObj.metadata?.orderId;
+        const paymentIntentId = sessionObj.payment_intent || null;
 
-    return res.json({ success: true });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: err.message });
-  }
-});
+        if (orderId) {
+          // paid へ更新
+          stmtUpdateOrderByOrderId.run({
+            orderId,
+            status: "paid",
+            stripeSessionId: sessionObj.id,
+            stripePaymentIntentId: paymentIntentId,
+            paidAt: new Date().toISOString(),
+          });
 
-// ===== 管理者ログイン（簡易）=====
-app.post("/admin-login", (req, res) => {
-  const { email, password } = req.body || {};
-
-  const inputEmail = String(email || "").trim().toLowerCase();
-  const inputPass  = String(password || "").trim();
-
-  const envEmail = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
-  const envPass  = String(process.env.ADMIN_PASSWORD || "").trim();
-
-  const ok = inputEmail !== "" && inputPass !== "" && inputEmail === envEmail && inputPass === envPass;
-  return res.json({ success: ok });
-});
-
-// ===== 注文一覧：指定日（YYYY-MM-DD）を返す =====
-app.get("/orders", async (req, res) => {
-  const dateStr = req.query.date; // "2026-03-02"
-  const date = dateStr ? new Date(dateStr + "T00:00:00") : new Date();
-  const orders = await readOrdersForDay(date);
-  return res.json(orders);
-});
-
-// ===== 売上集計：year/month/day =====
-app.get("/sales", async (req, res) => {
-  // /sales?year=2026&month=03&day=02
-  const year = req.query.year;
-  const month = req.query.month;
-  const day = req.query.day;
-
-  try {
-    if (!year) return res.status(400).json({ error: "year required" });
-
-    const base = path.join(DATA_ROOT, year);
-    let total = 0;
-
-    // 年合計
-    if (!month) {
-      const months = await fs.readdir(base).catch(() => []);
-      for (const m of months) {
-        const monthDir = path.join(base, m);
-        const days = await fs.readdir(monthDir).catch(() => []);
-        for (const d of days) {
-          const file = path.join(monthDir, d, "orders.json");
-          const arr = JSON.parse(await fs.readFile(file, "utf-8").catch(() => "[]"));
-          for (const o of arr) {
-            if (String(o.status).startsWith("paid")) total += Number(o.amount || 0);
+          // 注文情報を取得してメール
+          const order = stmtGetOrderByOrderId.get(orderId);
+          if (order) {
+            await sendPurchaseMail({
+              to: order.email,
+              name: order.name,
+              orderId: order.orderId,
+              amount: order.amount,
+              paymentMethod: order.paymentMethod,
+            });
           }
         }
       }
-      return res.json({ scope: "year", year, total });
-    }
 
-    // 月合計
-    const monthDir = path.join(base, month);
-    if (!day) {
-      const days = await fs.readdir(monthDir).catch(() => []);
-      for (const d of days) {
-        const file = path.join(monthDir, d, "orders.json");
-        const arr = JSON.parse(await fs.readFile(file, "utf-8").catch(() => "[]"));
-        for (const o of arr) {
-          if (String(o.status).startsWith("paid")) total += Number(o.amount || 0);
+      // 非同期決済用（PayPay/コンビニ等で必要になる場合あり）
+      if (event.type === "checkout.session.async_payment_succeeded") {
+        const sessionObj = event.data.object;
+        const orderId = sessionObj.metadata?.orderId;
+        if (orderId) {
+          stmtUpdateOrderByOrderId.run({
+            orderId,
+            status: "paid",
+            stripeSessionId: sessionObj.id,
+            stripePaymentIntentId: sessionObj.payment_intent || null,
+            paidAt: new Date().toISOString(),
+          });
+
+          const order = stmtGetOrderByOrderId.get(orderId);
+          if (order) {
+            await sendPurchaseMail({
+              to: order.email,
+              name: order.name,
+              orderId: order.orderId,
+              amount: order.amount,
+              paymentMethod: order.paymentMethod,
+            });
+          }
         }
       }
-      return res.json({ scope: "month", year, month, total });
-    }
 
-    // 日合計
-    const file = path.join(monthDir, day, "orders.json");
-    const arr = JSON.parse(await fs.readFile(file, "utf-8").catch(() => "[]"));
-    for (const o of arr) {
-      if (String(o.status).startsWith("paid")) total += Number(o.amount || 0);
+      return res.json({ received: true });
+    } catch (err) {
+      console.error("❌ webhook handler error:", err);
+      return res.status(500).send("Webhook handler failed");
     }
-    return res.json({ scope: "day", year, month, day, total });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: err.message });
   }
+);
+
+// ===== Admin: HTMLは直アクセス禁止（URL知ってても404） =====
+app.get("/admin.html", (req, res) => {
+  return res.status(404).send("Not Found");
 });
 
-// ===== 問い合わせ保存先 =====
-const CONTACT_FILE = path.join(__dirname, "data", "contacts.json");
+// ログインページは公開OK（public/admin-login.html を使う）
+app.get("/admin-login", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "admin-login.html"));
+});
 
+// ログイン成功した人だけ管理画面へ（URL知っててもログイン必須）
+app.get("/admin", (req, res) => {
+  if (!(req.session && req.session.admin === true)) {
+    return res.redirect("/admin-login");
+  }
+  return res.sendFile(path.join(__dirname, "public", "dashboard.html"));
+});
+
+// admin logout
+app.post("/admin-logout", (req, res) => {
+  req.session.destroy(() => res.json({ success: true }));
+});
+
+// 管理者ログイン（セッション付与）
+app.post("/admin-login", adminLoginLimiter, (req, res) => {
+  const { email, password } = req.body || {};
+
+  const inputEmail = String(email || "").trim().toLowerCase();
+  const inputPass = String(password || "").trim();
+
+  const envEmail = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
+  const envPass = String(process.env.ADMIN_PASSWORD || "").trim();
+
+  const ok =
+    inputEmail !== "" &&
+    inputPass !== "" &&
+    inputEmail === envEmail &&
+    inputPass === envPass;
+
+  if (ok) {
+    req.session.admin = true;
+    return res.json({ success: true });
+  }
+  return res.json({ success: false });
+});
+
+// ===== Admin APIs (ログイン必須) =====
+app.get("/api/orders", requireAdmin, (req, res) => {
+  const dateStr = req.query.date || new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  const rows = stmtOrdersByDate.all(dateStr);
+  return res.json(rows);
+});
+
+app.get("/api/sales", requireAdmin, (req, res) => {
+  const year = req.query.year;
+  const month = req.query.month; // 01-12
+  const day = req.query.day; // 01-31
+
+  if (!year) return res.status(400).json({ error: "year required" });
+
+  if (year && month && day) {
+    const total = stmtSalesDay.get(year, month, day).total;
+    return res.json({ scope: "day", year, month, day, total });
+  }
+  if (year && month) {
+    const total = stmtSalesMonth.get(year, month).total;
+    return res.json({ scope: "month", year, month, total });
+  }
+  const total = stmtSalesYear.get(year).total;
+  return res.json({ scope: "year", year, total });
+});
+
+// ===== Contact =====
 app.post("/contact", async (req, res) => {
   try {
     const { name, email, subject, message } = req.body || {};
@@ -304,14 +448,7 @@ app.post("/contact", async (req, res) => {
       return res.status(400).json({ error: "必須項目が不足しています" });
     }
 
-    let list = [];
-    try {
-      const txt = await fs.readFile(CONTACT_FILE, "utf-8");
-      list = JSON.parse(txt);
-    } catch {}
-
-    list.push({
-      id: "c_" + Date.now(),
+    stmtInsertContact.run({
       name,
       email,
       subject,
@@ -319,19 +456,17 @@ app.post("/contact", async (req, res) => {
       createdAt: new Date().toISOString(),
     });
 
-    await fs.mkdir(path.join(__dirname, "data"), { recursive: true });
-    await fs.writeFile(CONTACT_FILE, JSON.stringify(list, null, 2), "utf-8");
-
     return res.json({ success: true });
   } catch (err) {
+    console.error(err);
     return res.status(500).json({ error: err.message });
   }
 });
-
 
 app.listen(PORT, () => {
   console.log(`✅ Server running on ${BASE_URL}`);
   console.log(`広告:   ${BASE_URL}/ad.html`);
   console.log(`購入:   ${BASE_URL}/shop.html`);
-  console.log(`管理者: ${BASE_URL}/admin.html`);
+  console.log(`管理者ログイン: ${BASE_URL}/admin-login`);
+  console.log(`管理者（ログイン後）: ${BASE_URL}/admin`);
 });
