@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>管理画面</title>
+
+  <!-- 検索エンジンに載せない（URLを知ってる人は見れる） -->
+  <meta name="robots" content="noindex, nofollow" />
+
+  <link rel="stylesheet" href="css/style.css" />
+  <script defer src="js/dashboard.js"></script>
+</head>
+<body>
+  <div class="container">
+    <div class="nav">
+      <div class="brand">ADMIN <span>DASHBOARD</span></div>
+      <!-- 導線を作らないため、戻るリンクは置かない -->
+    </div>
+
+    <div class="card">
+      <h2 style="margin-top:0;">注文一覧（指定日）</h2>
+
+      <div class="row2">
+        <div>
+          <label>日付</label>
+          <input class="input" type="date" id="datePicker" />
+        </div>
+
+        <div>
+          <label>売上集計</label>
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button class="btn" id="sumDay">日</button>
+            <button class="btn" id="sumMonth">月</button>
+            <button class="btn" id="sumYear">年</button>
+          </div>
+          <div class="small" id="sumResult"></div>
+        </div>
+      </div>
+
+      <div style="height:10px;"></div>
+
+      <table class="table">
+        <thead>
+          <tr>
+            <th>注文ID</th>
+            <th>名前</th>
+            <th>支払</th>
+            <th>コンビニ</th>
+            <th>金額</th>
+            <th>状態</th>
+            <th>作成</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </div>
+</body>
+</html>

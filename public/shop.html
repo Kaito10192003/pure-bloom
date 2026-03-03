@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>購入フォーム</title>
+  <link rel="stylesheet" href="css/style.css" />
+  <script defer src="js/shop.js"></script>
+</head>
+<body>
+  <div class="container">
+    <div class="nav">
+      <div class="brand">PREMIUM <span>SUPPLEMENT</span></div>
+      <a class="btn" href="ad.html">広告へ戻る</a>
+    </div>
+
+    <div class="card">
+      <h2 style="margin-top:0;">購入情報入力</h2>
+
+      <form id="purchaseForm" class="form">
+        <div class="row2">
+          <div>
+            <label>名前</label>
+            <input class="input" type="text" name="name" required />
+          </div>
+          <div>
+            <label>メールアドレス</label>
+            <input class="input" type="email" name="email" required />
+          </div>
+        </div>
+
+        <div>
+          <label>電話番号（3-4-4）</label>
+          <div class="phone">
+            <input class="input" id="phone1" inputmode="numeric" maxlength="3" placeholder="090" />
+            <span>-</span>
+            <input class="input" id="phone2" inputmode="numeric" maxlength="4" placeholder="1234" />
+            <span>-</span>
+            <input class="input" id="phone3" inputmode="numeric" maxlength="4" placeholder="5678" />
+          </div>
+          <div class="small">3桁入力で自動で次へ移動</div>
+        </div>
+
+        <div>
+          <label>住所</label>
+          <input class="input" id="address" type="text" required placeholder="東京都〇〇区..." />
+        </div>
+
+        <div>
+          <label>支払方法</label>
+          <select class="input" id="paymentMethod">
+            <option value="card">クレジットカード</option>
+            <option value="konbini">コンビニ払い</option>
+            <option value="paypay">PayPay</option>
+          </select>
+          <div class="small">
+            ※実際の決済はStripe側で支払方法の有効化/承認が必要な場合があります。
+          </div>
+        </div>
+
+        <div id="konbiniArea" style="display:none;">
+          <label>コンビニを選択</label>
+          <select class="input" id="konbiniStore">
+            <option value="familymart">ファミリーマート</option>
+            <option value="lawson">ローソン</option>
+            <option value="ministop">ミニストップ</option>
+            <option value="seicomart">セイコーマート</option>
+          </select>
+          <div class="small">※決済プロバイダ側で対応チェーンが決まります。</div>
+        </div>
+
+        <div class="error" id="error"></div>
+
+        <button class="btn btn-gold" type="submit" id="buyBtn">購入して決済へ進む</button>
+        <div class="small">決済ページへ移動します（デモ）</div>
+      </form>
+    </div>
+  </div>
+</body>
+</html>

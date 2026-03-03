@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>決済完了</title>
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+  <div class="container">
+    <div class="nav">
+      <div class="brand">PREMIUM <span>SUPPLEMENT</span></div>
+      <a class="btn" href="ad.html">広告へ戻る</a>
+    </div>
+
+    <div class="card">
+      <h2 style="margin-top:0;">決済が完了しました（テスト）🎉</h2>
+      <p class="lead">ありがとうございます。注文を受け付けました。</p>
+
+      <p class="small" id="orderText"></p>
+
+      <a class="btn" href="shop.html" style="margin-left:10px;">もう一度購入</a>
+    </div>
+
+    <script>
+      const params = new URLSearchParams(location.search);
+      const orderId = params.get("orderId");
+      document.getElementById("orderText").textContent = orderId ? `注文ID: ${orderId}` : "";
+
+      // デモ：支払い済みにする（本番はWebhookで確定）
+      if (orderId) {
+        fetch("/mark-paid", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ orderId }),
+        });
+      }
+    </script>
+  </div>
+</body>
+</html>
