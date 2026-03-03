@@ -18,14 +18,30 @@ app.set("trust proxy", 1);
 // ===== Security middlewares =====
 app.use(helmet());
 
-// JSONはWebhook以外で使う
+// Stripe webhook 以外は JSON
 app.use((req, res, next) => {
-  // Stripe webhookだけは raw が必要なので後で個別に処理する
   if (req.originalUrl === "/stripe/webhook") return next();
-  express.json({ limit: "200kb" })(req, res, next);
+  return express.json({ limit: "200kb" })(req, res, next);
 });
 
-// 静的配信
+// ===== ここが超重要：管理画面ファイルの “直アクセス” をブロック =====
+// public 配下に置いてると express.static で誰でも見れてしまうので先に塞ぐ
+const BLOCKED_PUBLIC_PATHS = new Set([
+  "/admin.html",
+  "/dashboard.html",
+  "/js/dashboard.js",
+  "/js/admin.js",
+  "/js/dashboard.js.map",
+]);
+
+app.use((req, res, next) => {
+  if (BLOCKED_PUBLIC_PATHS.has(req.path)) {
+    return res.status(404).send("Not Found");
+  }
+  return next();
+});
+
+// 静的配信（上のブロックの後に置くのがポイント）
 app.use(express.static(path.join(__dirname, "public"), { maxAge: "1h" }));
 
 // ルートは広告へ
@@ -59,7 +75,7 @@ app.use(
     cookie: {
       httpOnly: true,
       sameSite: "lax",
-      secure: process.env.NODE_ENV === "production", // Renderはproduction扱いにしたいなら envでNODE_ENV=production
+      secure: process.env.NODE_ENV === "production",
       maxAge: 1000 * 60 * 60 * 6, // 6時間
     },
   })
@@ -235,7 +251,6 @@ app.post("/create-checkout-session", async (req, res) => {
       createdAt,
     });
 
-    // 支払方法（Stripe側で有効化が必要な場合あり）
     const payment_method_types = (() => {
       if (paymentMethod === "konbini") return ["konbini"];
       if (paymentMethod === "paypay") return ["paypay"];
@@ -262,11 +277,9 @@ app.post("/create-checkout-session", async (req, res) => {
         paymentMethod: paymentMethod || "card",
         konbiniStore: paymentMethod === "konbini" ? (konbiniStore || "") : "",
       },
-      // customer_email を入れると Stripe画面でメール扱いやすい
       customer_email: email,
     });
 
-    // session id をDBへ記録（支払照合に使える）
     stmtUpdateOrderByOrderId.run({
       orderId,
       status: "pending",
@@ -304,60 +317,36 @@ app.post(
     }
 
     try {
-      // 代表：Checkout完了
-      if (event.type === "checkout.session.completed") {
-        const sessionObj = event.data.object;
+      const markPaidAndMail = async (sessionObj) => {
         const orderId = sessionObj.metadata?.orderId;
-        const paymentIntentId = sessionObj.payment_intent || null;
+        if (!orderId) return;
 
-        if (orderId) {
-          // paid へ更新
-          stmtUpdateOrderByOrderId.run({
-            orderId,
-            status: "paid",
-            stripeSessionId: sessionObj.id,
-            stripePaymentIntentId: paymentIntentId,
-            paidAt: new Date().toISOString(),
+        stmtUpdateOrderByOrderId.run({
+          orderId,
+          status: "paid",
+          stripeSessionId: sessionObj.id,
+          stripePaymentIntentId: sessionObj.payment_intent || null,
+          paidAt: new Date().toISOString(),
+        });
+
+        const order = stmtGetOrderByOrderId.get(orderId);
+        if (order) {
+          await sendPurchaseMail({
+            to: order.email,
+            name: order.name,
+            orderId: order.orderId,
+            amount: order.amount,
+            paymentMethod: order.paymentMethod,
           });
-
-          // 注文情報を取得してメール
-          const order = stmtGetOrderByOrderId.get(orderId);
-          if (order) {
-            await sendPurchaseMail({
-              to: order.email,
-              name: order.name,
-              orderId: order.orderId,
-              amount: order.amount,
-              paymentMethod: order.paymentMethod,
-            });
-          }
         }
+      };
+
+      if (event.type === "checkout.session.completed") {
+        await markPaidAndMail(event.data.object);
       }
 
-      // 非同期決済用（PayPay/コンビニ等で必要になる場合あり）
       if (event.type === "checkout.session.async_payment_succeeded") {
-        const sessionObj = event.data.object;
-        const orderId = sessionObj.metadata?.orderId;
-        if (orderId) {
-          stmtUpdateOrderByOrderId.run({
-            orderId,
-            status: "paid",
-            stripeSessionId: sessionObj.id,
-            stripePaymentIntentId: sessionObj.payment_intent || null,
-            paidAt: new Date().toISOString(),
-          });
-
-          const order = stmtGetOrderByOrderId.get(orderId);
-          if (order) {
-            await sendPurchaseMail({
-              to: order.email,
-              name: order.name,
-              orderId: order.orderId,
-              amount: order.amount,
-              paymentMethod: order.paymentMethod,
-            });
-          }
-        }
+        await markPaidAndMail(event.data.object);
       }
 
       return res.json({ received: true });
@@ -368,30 +357,27 @@ app.post(
   }
 );
 
-// ===== Admin: HTMLは直アクセス禁止（URL知ってても404） =====
-app.get("/admin.html", (req, res) => {
-  return res.status(404).send("Not Found");
-});
+// ===== Admin routes =====
+// 「admin.html」は存在してても 404 にする（リンクから行けない）
+app.get("/admin.html", (req, res) => res.status(404).send("Not Found"));
 
-// ログインページは公開OK（public/admin-login.html を使う）
+// ログインページは公開OK（public/admin-login.html）
 app.get("/admin-login", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "admin-login.html"));
 });
 
-// ログイン成功した人だけ管理画面へ（URL知っててもログイン必須）
+// ログイン成功した人だけ管理画面へ
 app.get("/admin", (req, res) => {
-  if (!(req.session && req.session.admin === true)) {
-    return res.redirect("/admin-login");
-  }
+  if (!(req.session && req.session.admin === true)) return res.redirect("/admin-login");
   return res.sendFile(path.join(__dirname, "public", "dashboard.html"));
 });
 
-// admin logout
+// logout
 app.post("/admin-logout", (req, res) => {
   req.session.destroy(() => res.json({ success: true }));
 });
 
-// 管理者ログイン（セッション付与）
+// login (セッション付与)
 app.post("/admin-login", adminLoginLimiter, (req, res) => {
   const { email, password } = req.body || {};
 
@@ -401,11 +387,7 @@ app.post("/admin-login", adminLoginLimiter, (req, res) => {
   const envEmail = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
   const envPass = String(process.env.ADMIN_PASSWORD || "").trim();
 
-  const ok =
-    inputEmail !== "" &&
-    inputPass !== "" &&
-    inputEmail === envEmail &&
-    inputPass === envPass;
+  const ok = inputEmail && inputPass && inputEmail === envEmail && inputPass === envPass;
 
   if (ok) {
     req.session.admin = true;
@@ -416,7 +398,7 @@ app.post("/admin-login", adminLoginLimiter, (req, res) => {
 
 // ===== Admin APIs (ログイン必須) =====
 app.get("/api/orders", requireAdmin, (req, res) => {
-  const dateStr = req.query.date || new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  const dateStr = req.query.date || new Date().toISOString().slice(0, 10);
   const rows = stmtOrdersByDate.all(dateStr);
   return res.json(rows);
 });
